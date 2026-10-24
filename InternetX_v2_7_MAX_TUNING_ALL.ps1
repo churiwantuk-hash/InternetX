@@ -3592,37 +3592,71 @@ function New-IXTButton {
     return $button
 }
 
+function Update-IXTFieldColor {
+    # Blue = what Windows has now, amber = changed in the window but not applied yet.
+    param([object]$Field)
+    if ($null -eq $Field -or $null -eq $script:IXT) { return }
+    $control = $Field.Control
+    if ($Field.Section -eq 'Info') { $control.ForeColor = $script:IXT.Muted; return }
+    if (-not $control.Enabled) { return }
+    $changed = ((Get-IXTFieldValue -Field $Field) -ne [string]$Field.Loaded)
+    $control.ForeColor = $(if ($changed) { $script:IXT.Changed } else { $script:IXT.Value })
+    Update-IXTPendingLabel
+}
+
+function Update-IXTPendingLabel {
+    if ($null -eq $script:IXT -or $null -eq $script:IXT.PendingLabel) { return }
+    $pending = @($script:IXT.Fields | Where-Object { $_.Section -ne 'Info' -and $_.Control.Enabled -and ((Get-IXTFieldValue -Field $_) -ne [string]$_.Loaded) }).Count
+    if ($pending -eq 0) { $script:IXT.PendingLabel.Text = 'No pending changes'; $script:IXT.PendingLabel.ForeColor = $script:IXT.Muted }
+    else { $script:IXT.PendingLabel.Text = ('{0} pending change(s) - shown in amber' -f $pending); $script:IXT.PendingLabel.ForeColor = $script:IXT.Changed }
+}
+
 function Add-IXTRow {
+    # One "Label: [value]" row. -Editable gives a combo you can type into, -ReadOnly a display-only box.
     param(
         [object]$Parent,[string]$Section,[string]$Name,[string]$Label,[int]$Y,
-        [int]$LabelW,[int]$CtrlW,[string[]]$Items,[object]$Map,[switch]$TextBox
+        [int]$LabelW,[int]$CtrlW,[string[]]$Items,[object]$Map,[switch]$TextBox,[switch]$Editable,
+        [switch]$ReadOnly,[string]$Unit = '',[int]$LabelX = 8
     )
     $caption = New-Object System.Windows.Forms.Label
     $caption.Text = $Label + ':'
-    $caption.Location = New-Object System.Drawing.Point(8,($Y + 3))
+    $caption.Location = New-Object System.Drawing.Point($LabelX,($Y + 3))
     $caption.Size = New-Object System.Drawing.Size($LabelW,16)
     $caption.ForeColor = $script:IXT.Fore
     $caption.AutoEllipsis = $true
     $script:IXT.Tip.SetToolTip($caption,$Label)
     $Parent.Controls.Add($caption)
 
-    if ($TextBox) {
+    if ($TextBox -or $ReadOnly) {
         $control = New-Object System.Windows.Forms.TextBox
         $control.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        if ($ReadOnly) { $control.ReadOnly = $true; $control.TabStop = $false }
     } else {
         $control = New-Object System.Windows.Forms.ComboBox
-        $control.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $control.DropDownStyle = $(if ($Editable) { [System.Windows.Forms.ComboBoxStyle]::DropDown } else { [System.Windows.Forms.ComboBoxStyle]::DropDownList })
         $control.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $control.DropDownWidth = [Math]::Max($CtrlW,220)
         if ($Map) { foreach ($value in @($Map.Values)) { [void]$control.Items.Add([string]$value) } }
         elseif ($Items) { foreach ($value in $Items) { [void]$control.Items.Add([string]$value) } }
     }
-    $control.Location = New-Object System.Drawing.Point(($LabelW + 10),$Y)
+    $control.Location = New-Object System.Drawing.Point(($LabelX + $LabelW + 2),$Y)
     $control.Width = $CtrlW
     $control.BackColor = [System.Drawing.Color]::Black
-    $control.ForeColor = [System.Drawing.Color]::White
+    $control.ForeColor = $script:IXT.Value
     $Parent.Controls.Add($control)
-    return (New-IXTField -Section $Section -Name $Name -Control $control -Map $Map)
+    if ($Unit) {
+        $unitLabel = New-Object System.Windows.Forms.Label
+        $unitLabel.Text = $Unit
+        $unitLabel.Location = New-Object System.Drawing.Point(($LabelX + $LabelW + $CtrlW + 5),($Y + 3))
+        $unitLabel.Size = New-Object System.Drawing.Size(32,16)
+        $unitLabel.ForeColor = $script:IXT.Fore
+        $Parent.Controls.Add($unitLabel)
+    }
+    $field = New-IXTField -Section $Section -Name $Name -Control $control -Map $Map
+    $control.Tag = $field
+    $control.Add_TextChanged({ try { Update-IXTFieldColor -Field $this.Tag } catch { } })
+    if ($control -is [System.Windows.Forms.ComboBox]) { $control.Add_SelectedIndexChanged({ try { Update-IXTFieldColor -Field $this.Tag } catch { } }) }
+    return $field
 }
 
 function Read-IXTFile {
@@ -3643,7 +3677,7 @@ function Save-IXTFile {
     param([string]$Path)
     $data = [ordered]@{}
     foreach ($field in $script:IXT.Fields) {
-        if ($field.Control.Enabled) { $data[[string]($field.Section + '|' + $field.Name)] = [string]$field.Loaded }
+        if ($field.Control.Enabled -and $field.Section -ne 'Info') { $data[[string]($field.Section + '|' + $field.Name)] = [string]$field.Loaded }
     }
     try {
         $data | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
@@ -3661,6 +3695,7 @@ function Import-IXTFile {
     if ($null -eq $saved) { Add-IXTLog ('No {0} file exists for this adapter yet.' -f $What); return }
     $count = 0
     foreach ($field in $script:IXT.Fields) {
+        if ($field.Section -eq 'Info') { continue }
         $key = $field.Section + '|' + $field.Name
         if ($field.Control.Enabled -and $saved.ContainsKey($key) -and ([string]$saved[$key] -ne (Get-IXTFieldValue -Field $field))) {
             Set-IXTFieldValue -Field $field -Value ([string]$saved[$key])
@@ -3671,11 +3706,103 @@ function Import-IXTFile {
     else { Add-IXTLog ('{0}: {1} value(s) loaded into the window. Press Apply All to write them.' -f $What,$count) }
 }
 
+function Get-IXTFixedRows {
+    # Rows shown in the same order as the classic tweaker. Candidates are the registry keywords
+    # different drivers use for the same option; the first one the driver exposes is used.
+    return @{
+        Rss = @(
+            @('DisablePortScaling',@('*DisablePortScaling','DisablePortScaling')),
+            @('ManyCoreScaling',@('*ManyCoreScaling','ManyCoreScaling'))
+        )
+        Adv = @(
+            @('FlowControl',@('*FlowControl')),
+            @('IPChecksumOffloadIPv4',@('*IPChecksumOffloadIPv4')),
+            @('TCPChecksumOffloadIPv4',@('*TCPChecksumOffloadIPv4')),
+            @('TCPChecksumOffloadIPv6',@('*TCPChecksumOffloadIPv6')),
+            @('UDPChecksumOffloadIPv4',@('*UDPChecksumOffloadIPv4')),
+            @('UDPChecksumOffloadIPv6',@('*UDPChecksumOffloadIPv6')),
+            @('LsoV1IPv4',@('*LsoV1IPv4')),
+            @('LsoV2IPv4',@('*LsoV2IPv4')),
+            @('LsoV2IPv6',@('*LsoV2IPv6')),
+            @('PMARPOffload',@('*PMARPOffload')),
+            @('PMNSOffload',@('*PMNSOffload')),
+            @('PriorityVLANTag',@('*PriorityVLANTag')),
+            @('ReceiveBuffers',@('*ReceiveBuffers')),
+            @('TransmitBuffers',@('*TransmitBuffers')),
+            @('InterruptModeration',@('*InterruptModeration')),
+            @('InterruptModerationRate',@('ITR','*InterruptModerationRate','InterruptModerationRate')),
+            @('TxIntDelay',@('TxIntDelay')),
+            @('PacketDirect',@('*PacketDirect')),
+            @('Coalesce',@('*PacketCoalescing','Coalesce')),
+            @('CoalesceBufferSize',@('CoalesceBufferSize')),
+            @('UdpTxScaling',@('*UdpTxScaling','UdpTxScaling'))
+        )
+        Power = @(
+            @('(APM) sleep states',@('EnableAPM','*EnableAPM','APMSleepStates')),
+            @('DynamicPowerGating',@('EnableDynamicPowerGating','*EnableDynamicPowerGating')),
+            @('ConnectedPowerGating',@('EnableConnectedPowerGating','*EnableConnectedPowerGating')),
+            @('AutoPowerSaveMode',@('AutoPowerSaveModeEnabled','*AutoPowerSaveModeEnabled')),
+            @('NicAutoPowerSaver',@('NicAutoPowerSaver','*NicAutoPowerSaver')),
+            @('DelayedPowerUp',@('DelayedPowerUp','*DelayedPowerUp')),
+            @('ReduceSpeedOnPowerDown',@('ReduceSpeedOnPowerDown','*ReduceSpeedOnPowerDown'))
+        )
+    }
+}
+
+function Set-IXTAdvBinding {
+    # Connects a row to a driver property, or locks it as "Undeclared" when the driver has none.
+    param([object]$Field,[AllowNull()][object]$Property)
+    $control = $Field.Control
+    $control.Items.Clear()
+    if ($null -eq $Property) {
+        $Field.Map = $null; $Field.Loaded = ''
+        $control.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        [void]$control.Items.Add('Undeclared')
+        $control.SelectedIndex = 0
+        $control.Enabled = $false
+        $script:IXT.Tip.SetToolTip($control,'Not exposed by this adapter''s driver. InternetX only changes values the driver lists.')
+        return
+    }
+    $keyword = [string]$Property.RegistryKeyword
+    $Field.Name = $keyword
+    $registryValues = @($Property.ValidRegistryValues | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    $displayValues = @($Property.ValidDisplayValues | Where-Object { $null -ne $_ } | ForEach-Object { ([string]$_).Trim() })
+    $map = $null
+    if ($registryValues.Count -gt 0 -and $registryValues.Count -eq $displayValues.Count) {
+        $map = [ordered]@{}
+        for ($i = 0; $i -lt $registryValues.Count; $i++) {
+            if (-not $map.Contains($registryValues[$i])) { $map[[object]$registryValues[$i]] = ('{0} - {1}' -f $registryValues[$i],$displayValues[$i]) }
+        }
+    }
+    $Field.Map = $map
+    if ($map) {
+        $control.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        foreach ($value in @($map.Values)) { [void]$control.Items.Add([string]$value) }
+    } else {
+        # Numeric option: type a value; the driver's allowed range is in the tooltip.
+        $control.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    }
+    $current = ''
+    $currentValues = @($Property.RegistryValue)
+    if ($currentValues.Count -gt 0 -and $null -ne $currentValues[0]) { $current = [string]$currentValues[0] }
+    $Field.Loaded = $current
+    $control.Enabled = $true
+    Set-IXTFieldValue -Field $Field -Value $current
+    $hint = ('{0}  [{1}]' -f [string]$Property.DisplayName,$keyword)
+    if ($null -ne $Property.NumericParameterMinValue -and $null -ne $Property.NumericParameterMaxValue) {
+        $script:IXT.Ranges[$keyword] = @($Property.NumericParameterMinValue,$Property.NumericParameterMaxValue)
+        $hint += (' - allowed {0} to {1}' -f $Property.NumericParameterMinValue,$Property.NumericParameterMaxValue)
+    }
+    $script:IXT.Tip.SetToolTip($control,$hint)
+    Update-IXTFieldColor -Field $Field
+}
+
 function Update-IXTAdvancedFields {
-    # Adv. Adapter / PowerSaving rows are built from what the installed driver really exposes.
+    # Adv. Adapter and PowerSaving: the classic rows first, then every other option this driver exposes.
     $adapter = $script:IXT.Adapter
+    $fixed = Get-IXTFixedRows
     $powerPattern = '(?i)Power|EEE|Green|Wake|WoL|PME|Energy|ULP|Sleep|Gating|ASPM|Selective.?Suspend'
-    foreach ($panel in @($script:IXT.AdvPanel,$script:IXT.PowerPanel)) { $panel.SuspendLayout(); $panel.Controls.Clear() }
+    foreach ($panel in @($script:IXT.AdvPanel,$script:IXT.PowerPanel)) { $panel.SuspendLayout(); $panel.Controls.Clear(); $panel.AutoScrollPosition = New-Object System.Drawing.Point(0,0) }
     $kept = New-Object 'System.Collections.Generic.List[object]'
     foreach ($field in $script:IXT.Fields) { if (@('Adv','Power') -notcontains $field.Section) { [void]$kept.Add($field) } }
     $script:IXT.Fields = $kept
@@ -3683,44 +3810,69 @@ function Update-IXTAdvancedFields {
     $properties = @()
     try {
         $properties = @(Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction Stop |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.RegistryKeyword) } | Sort-Object RegistryKeyword)
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.RegistryKeyword) -and [string]$_.RegistryKeyword -ne 'NetworkAddress' } | Sort-Object RegistryKeyword)
     } catch { Add-IXTLog ('Advanced properties could not be read: ' + $_.Exception.Message) }
-
-    $yAdv = 2; $yPower = 2
-    foreach ($property in $properties) {
-        $keyword = [string]$property.RegistryKeyword
-        $isPower = ($keyword -match $powerPattern) -or ([string]$property.DisplayName -match $powerPattern)
-        # A MAC override is not a tuning option and is easy to mistype.
-        if ($keyword -eq 'NetworkAddress') { continue }
-        $registryValues = @($property.ValidRegistryValues | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
-        $displayValues = @($property.ValidDisplayValues | Where-Object { $null -ne $_ } | ForEach-Object { ([string]$_).Trim() })
-        $map = $null
-        if ($registryValues.Count -gt 0 -and $registryValues.Count -eq $displayValues.Count) {
-            $map = [ordered]@{}
-            for ($i = 0; $i -lt $registryValues.Count; $i++) {
-                if (-not $map.Contains($registryValues[$i])) { $map[[object]$registryValues[$i]] = ('{0} - {1}' -f $registryValues[$i],$displayValues[$i]) }
-            }
+    $used = @{}
+    $findProperty = {
+        param([string[]]$Candidates)
+        foreach ($candidate in $Candidates) {
+            $match = @($properties | Where-Object { [string]$_.RegistryKeyword -eq $candidate } | Select-Object -First 1)
+            if ($match.Count -gt 0) { return $match[0] }
         }
-        $current = ''
-        $currentValues = @($property.RegistryValue)
-        if ($currentValues.Count -gt 0) { $current = [string]$currentValues[0] }
+        return $null
+    }
 
-        if ($isPower) { $panel = $script:IXT.PowerPanel; $section = 'Power'; $y = $yPower; $yPower += 22 }
-        else { $panel = $script:IXT.AdvPanel; $section = 'Adv'; $y = $yAdv; $yAdv += 22 }
-        $field = Add-IXTRow -Parent $panel -Section $section -Name $keyword -Label ($keyword.TrimStart('*')) -Y $y -LabelW 158 -CtrlW 160 -Map $map -TextBox:($null -eq $map)
-        $field.Loaded = $current
-        Set-IXTFieldValue -Field $field -Value $current
-        $hint = [string]$property.DisplayName
-        if ($null -ne $property.NumericParameterMinValue -and $null -ne $property.NumericParameterMaxValue) {
-            $script:IXT.Ranges[$keyword] = @($property.NumericParameterMinValue,$property.NumericParameterMaxValue)
-            $hint += (' (allowed: {0} - {1})' -f $property.NumericParameterMinValue,$property.NumericParameterMaxValue)
+    # RSS group rows (static controls, re-bound for each adapter).
+    foreach ($field in @($script:IXT.Fields | Where-Object { $_.Section -eq 'AdvRss' })) {
+        $row = @($fixed.Rss | Where-Object { $_[0] -eq $field.Label })
+        $property = if ($row.Count -gt 0) { & $findProperty $row[0][1] } else { $null }
+        if ($property) { $used[[string]$property.RegistryKeyword] = $true }
+        Set-IXTAdvBinding -Field $field -Property $property
+    }
+
+    $layout = @(
+        @{ Panel = $script:IXT.AdvPanel; Section = 'Adv'; Rows = $fixed.Adv; LabelW = 150; CtrlW = 156 },
+        @{ Panel = $script:IXT.PowerPanel; Section = 'Power'; Rows = $fixed.Power; LabelW = 132; CtrlW = 96 }
+    )
+    $boundRows = @{}
+    foreach ($part in $layout) {
+        $y = 2
+        foreach ($row in $part.Rows) {
+            $field = Add-IXTRow -Parent $part.Panel -Section $part.Section -Name $row[0] -Label $row[0] -Y $y -LabelW $part.LabelW -CtrlW $part.CtrlW
+            $field | Add-Member -NotePropertyName Label -NotePropertyValue $row[0] -Force
+            $property = & $findProperty $row[1]
+            if ($property) { $used[[string]$property.RegistryKeyword] = $true }
+            Set-IXTAdvBinding -Field $field -Property $property
+            $y += 21
         }
-        $script:IXT.Tip.SetToolTip($field.Control,$hint)
+        $boundRows[$part.Section] = $y
+    }
+    # Everything else the driver exposes, so no option is hidden.
+    $extras = @($properties | Where-Object { -not $used.ContainsKey([string]$_.RegistryKeyword) })
+    foreach ($part in $layout) {
+        $mine = @($extras | Where-Object { ((([string]$_.RegistryKeyword -match $powerPattern) -or ([string]$_.DisplayName -match $powerPattern)) -eq ($part.Section -eq 'Power')) })
+        if ($mine.Count -eq 0) { continue }
+        $y = $boundRows[$part.Section] + 4
+        $note = New-Object System.Windows.Forms.Label
+        $note.Text = 'More options from this driver:'
+        $note.Location = New-Object System.Drawing.Point(8,$y); $note.Size = New-Object System.Drawing.Size(($part.Panel.Width - 30),16)
+        $note.ForeColor = $script:IXT.Muted
+        $part.Panel.Controls.Add($note)
+        $y += 20
+        foreach ($property in $mine) {
+            $label = ([string]$property.RegistryKeyword).TrimStart('*')
+            $field = Add-IXTRow -Parent $part.Panel -Section $part.Section -Name ([string]$property.RegistryKeyword) -Label $label -Y $y -LabelW $part.LabelW -CtrlW $part.CtrlW
+            $field | Add-Member -NotePropertyName Label -NotePropertyValue $label -Force
+            Set-IXTAdvBinding -Field $field -Property $property
+            $y += 21
+        }
     }
     foreach ($panel in @($script:IXT.AdvPanel,$script:IXT.PowerPanel)) { $panel.ResumeLayout() }
 }
 
 function Read-IXTValues {
+    # -Only limits the refresh to some sections, so switching the Store keeps other pending edits.
+    param([string[]]$Only)
     $adapter = $script:IXT.Adapter
     $values = @{}
 
@@ -3756,12 +3908,27 @@ function Read-IXTValues {
 
     try {
         $family = if ($script:IXT.ChkV4.Checked -or -not $script:IXT.ChkV6.Checked) { 'IPv4' } else { 'IPv6' }
-        $ipInterface = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family -ErrorAction Stop | Select-Object -First 1
+        $store = [string]$script:IXT.StoreCombo.SelectedItem
+        if (-not $store) { $store = 'ActiveStore' }
+        $ipInterface = $null
+        try { $ipInterface = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family -PolicyStore $store -ErrorAction Stop | Select-Object -First 1 } catch { }
+        if (-not $ipInterface -and $store -eq 'PersistentStore') {
+            # Windows only keeps a saved copy for interfaces whose settings were changed.
+            Add-IXTLog 'This interface has no saved (persistent) copy, so Windows uses its defaults after a restart. Showing the active values.'
+            $wasLoading = $script:IXT.Loading
+            $script:IXT.Loading = $true
+            try { $script:IXT.StoreCombo.SelectedIndex = 0 } finally { $script:IXT.Loading = $wasLoading }
+            $ipInterface = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family -PolicyStore ActiveStore -ErrorAction Stop | Select-Object -First 1
+        }
         foreach ($name in $script:IXT.InterfaceNames) {
             foreach ($candidate in @($name,($name -replace '(Ms|Bytes)$',''))) {
                 $property = $ipInterface.PSObject.Properties[$candidate]
                 if ($property -and $null -ne $property.Value) { $values['Interface|' + $name] = [string]$property.Value; break }
             }
+        }
+        foreach ($name in @('NeighborDiscoverySupported','ReachableTime')) {
+            $property = $ipInterface.PSObject.Properties[$name]
+            if ($property -and $null -ne $property.Value) { $values['Info|' + $name] = [string]$property.Value }
         }
     } catch { }
 
@@ -3770,19 +3937,22 @@ function Read-IXTValues {
     }
 
     foreach ($field in $script:IXT.Fields) {
-        if (@('Adv','Power') -contains $field.Section) { continue }
+        if (@('Adv','Power','AdvRss') -contains $field.Section) { continue }
+        if ($Only -and $Only -notcontains $field.Section) { continue }
         $key = $field.Section + '|' + $field.Name
         if ($values.ContainsKey($key)) {
             $field.Control.Enabled = $true
             $field.Loaded = [string]$values[$key]
             Set-IXTFieldValue -Field $field -Value $field.Loaded
+            Update-IXTFieldColor -Field $field
         } else {
             # Not exposed by this adapter / Windows build.
             $field.Loaded = ''
-            if ($field.Control -is [System.Windows.Forms.ComboBox]) { $field.Control.SelectedIndex = -1 } else { $field.Control.Text = '' }
+            if ($field.Control -is [System.Windows.Forms.ComboBox]) { $field.Control.SelectedIndex = -1; $field.Control.Text = '' } else { $field.Control.Text = '' }
             $field.Control.Enabled = $false
         }
     }
+    Update-IXTPendingLabel
 }
 
 function Read-IXTAll {
@@ -3791,7 +3961,7 @@ function Read-IXTAll {
 }
 
 function Set-IXTStablePreset {
-    # Fills the window with the same conservative values as the console LOW PING PROFILE.
+    # Fills the window with the same conservative values as the console stability profile.
     # Nothing is written until Apply; rows the driver does not expose are skipped.
     $rules = Get-IXLowPingRules
     $count = 0
@@ -3832,7 +4002,24 @@ function Set-IXTStablePreset {
         Add-IXTLog ('Note: interface MTU is {0}. The preset does not type an MTU; it follows Jumbo Packet. Run the MTU test (menu 3) afterwards.' -f $mtu)
     }
     if ($count -eq 0) { Add-IXTLog 'Stable preset: this adapter already has these values.' }
-    else { Add-IXTLog ('Stable preset: {0} value(s) filled in. Check them, then press Apply All and Restart Adapter.' -f $count) }
+    else { Add-IXTLog ('Stable preset: {0} value(s) filled in (amber). Check them, then press Apply All and Restart Adapter.' -f $count) }
+}
+
+function Enable-IXTRssSupport {
+    # Fills every RSS switch this adapter offers; nothing is written until Apply.
+    $count = 0
+    foreach ($field in $script:IXT.Fields) {
+        if (-not $field.Control.Enabled) { continue }
+        $target = $null
+        if ($field.Section -eq 'RSS' -and $field.Name -eq 'Status') { $target = 'Enabled' }
+        elseif ($field.Section -eq 'Global' -and $field.Name -eq 'ReceiveSideScaling') { $target = 'Enabled' }
+        elseif ($field.Section -eq 'Adv' -and $field.Name -eq '*RSS' -and $field.Map) {
+            foreach ($mapKey in @($field.Map.Keys)) { if ([string]$field.Map[[object]$mapKey] -match '(?i) - Enabled$') { $target = [string]$mapKey; break } }
+        }
+        if ($null -ne $target -and $target -ne (Get-IXTFieldValue -Field $field)) { Set-IXTFieldValue -Field $field -Value $target; $count++ }
+    }
+    if ($count -eq 0) { Add-IXTLog 'RSS is already enabled everywhere this adapter allows.' }
+    else { Add-IXTLog ('Enable RSS Support: {0} value(s) filled in (amber). Press Apply All to write them.' -f $count) }
 }
 
 function Select-IXTAdapter {
@@ -3842,9 +4029,10 @@ function Select-IXTAdapter {
     $script:IXT.Adapter = $adapter
     $script:IXT.ClassKey = Get-IXTClassKey -Adapter $adapter
     $script:IXT.InterruptPath = Get-IXTInterruptPath -Adapter $adapter
-    $script:IXT.RegistryLabel.Text = 'Registry:  ' + $(if ($script:IXT.ClassKey) { $script:IXT.ClassKey } else { 'not found' })
-    $script:IXT.NdisLabel.Text = 'NDIS:  {0}     Status: {1}     Link: {2}' -f $adapter.NdisVersion,$adapter.Status,$adapter.LinkSpeed
-    Read-IXTAll
+    $script:IXT.RegistryLabel.Text = 'Registry:   ' + $(if ($script:IXT.ClassKey) { $script:IXT.ClassKey -replace '^HKEY_LOCAL_MACHINE','HKLM:' } else { 'not found' })
+    $script:IXT.NdisLabel.Text = 'NDIS:          {0}        Status: {1}        Link: {2}' -f $adapter.NdisVersion,$adapter.Status,$adapter.LinkSpeed
+    $script:IXT.Loading = $true
+    try { Read-IXTAll } finally { $script:IXT.Loading = $false }
     Add-IXTLog ('Adapter loaded: ' + $adapter.InterfaceDescription)
 
     $originalPath = Get-IXTProfilePath -Adapter $adapter -Kind 'Original'
@@ -3900,15 +4088,23 @@ function Set-IXTSetting {
             if ($script:IXT.ChkV6.Checked) { $families += 'IPv6' }
             if ($families.Count -eq 0) { throw 'Tick IPv4 and/or IPv6 first.' }
             foreach ($family in $families) {
+                # Windows' own default write first, then make sure a saved copy exists for after a restart.
                 Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family @parameters -ErrorAction Stop | Out-Null
+                $saved = $null
+                try { $saved = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family -PolicyStore PersistentStore -ErrorAction Stop | Select-Object -First 1 } catch { }
+                if (-not $saved) {
+                    try { Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family -PolicyStore PersistentStore @parameters -ErrorAction Stop | Out-Null }
+                    catch { Add-IXTLog ('{0} ({1}) is active now, but Windows kept no saved copy, so it may return to default after a restart.' -f $name,$family) }
+                }
             }
         }
-        { $_ -in @('Adv','Power') } {
+        { $_ -in @('Adv','Power','AdvRss') } {
             Set-NetAdapterAdvancedProperty -Name $adapter.Name -RegistryKeyword $name -RegistryValue $Value -NoRestart -ErrorAction Stop | Out-Null
         }
         'AFD' {
             Set-IXTRegDword -Path $script:IXT.AfdPath -Name $name -Text $Value
         }
+        default { throw ('{0} is display-only.' -f $name) }
     }
 }
 
@@ -3918,11 +4114,11 @@ function Invoke-IXTApply {
     $changed = @($script:IXT.Fields | Where-Object { ($Sections -contains $_.Section) -and $_.Control.Enabled -and ((Get-IXTFieldValue -Field $_) -ne [string]$_.Loaded) })
     if ($changed.Count -eq 0) { Add-IXTLog 'Nothing to apply: the window matches the current Windows values.'; return }
 
-    $preview = @($changed | Select-Object -First 12 | ForEach-Object {
-        '{0}: {1} -> {2}' -f $_.Name,$(if ($_.Loaded -eq '') { '(not set)' } else { $_.Loaded }),$(if ((Get-IXTFieldValue -Field $_) -eq '') { '(not set)' } else { Get-IXTFieldValue -Field $_ })
+    $preview = @($changed | Select-Object -First 14 | ForEach-Object {
+        '{0}: {1} -> {2}' -f ([string]$_.Name).TrimStart('*'),$(if ($_.Loaded -eq '') { '(not set)' } else { $_.Loaded }),$(if ((Get-IXTFieldValue -Field $_) -eq '') { '(not set)' } else { Get-IXTFieldValue -Field $_ })
     })
-    if ($changed.Count -gt 12) { $preview += ('... and {0} more' -f ($changed.Count - 12)) }
-    $message = ('Apply {0} change(s) to:' -f $changed.Count) + "`n" + $script:IXT.Adapter.InterfaceDescription + "`n`n" + ($preview -join "`n")
+    if ($changed.Count -gt 14) { $preview += ('... and {0} more' -f ($changed.Count - 14)) }
+    $message = ('Apply {0} change(s) to:' -f $changed.Count) + "`n" + $script:IXT.Adapter.InterfaceDescription + "`n`n" + ($preview -join "`n") + "`n`nOriginal values are backed up and can be restored with Load Original + Apply All."
     $answer = [System.Windows.Forms.MessageBox]::Show($script:IXT.Form,$message,'InternetX - confirm changes',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question)
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { Add-IXTLog 'Cancelled. Nothing changed.'; return }
 
@@ -3932,15 +4128,15 @@ function Invoke-IXTApply {
         try {
             Set-IXTSetting -Field $field -Value $value
             $applied++
-            Add-IXTLog ('APPLIED {0}: {1} -> {2}' -f $field.Name,$field.Loaded,$value)
+            Add-IXTLog ('APPLIED {0}: {1} -> {2}' -f ([string]$field.Name).TrimStart('*'),$field.Loaded,$value)
         } catch {
             $failed++
-            Add-IXTLog ('FAILED {0}: {1}' -f $field.Name,$_.Exception.Message)
+            Add-IXTLog ('FAILED {0}: {1}' -f ([string]$field.Name).TrimStart('*'),$_.Exception.Message)
         }
     }
     Read-IXTAll
     if (Save-IXTFile -Path (Get-IXTProfilePath -Adapter $script:IXT.Adapter -Kind 'Profile')) {
-        Add-IXTLog ('Done. Applied: {0} | Failed: {1}. Profile saved; Windows keeps these values after restart.' -f $applied,$failed)
+        Add-IXTLog ('Done. Applied: {0} | Failed: {1}. Profile saved.' -f $applied,$failed)
     }
     Add-IXTLog 'Adapter options need Restart Adapter. RSS Global, Interrupt and Tweaks need a Windows restart.'
 }
@@ -3948,8 +4144,11 @@ function Invoke-IXTApply {
 function New-IXTweakerForm {
     $script:IXT = @{
         Fields = (New-Object 'System.Collections.Generic.List[object]')
-        Adapter = $null; Adapters = @(); ClassKey = $null; InterruptPath = $null
-        Fore = [System.Drawing.Color]::FromArgb(140,180,255)
+        Adapter = $null; Adapters = @(); ClassKey = $null; InterruptPath = $null; Loading = $false
+        Fore = [System.Drawing.Color]::FromArgb(110,160,235)
+        Value = [System.Drawing.Color]::FromArgb(90,170,255)
+        Changed = [System.Drawing.Color]::FromArgb(255,186,60)
+        Muted = [System.Drawing.Color]::FromArgb(120,130,150)
         TcpipPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
         NdisPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters'
         AfdPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\AFD\Parameters'
@@ -3958,169 +4157,236 @@ function New-IXTweakerForm {
         InterfaceNames = @()
         Ranges = @{}
     }
-    $rowHeight = 22
+    $row = 21
     $onOff = @('Enabled','Disabled')
     $green = [System.Drawing.Color]::FromArgb(120,220,120)
     $red = [System.Drawing.Color]::FromArgb(235,90,90)
     $yellow = [System.Drawing.Color]::FromArgb(230,200,90)
+    $blue = $script:IXT.Fore
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Network Adapter - Tweaker  |  InternetX'
-    $form.BackColor = [System.Drawing.Color]::FromArgb(14,16,22)
+    $form.Text = 'Network Adapter - Tweaker  |  InternetX v2.7'
+    $form.BackColor = [System.Drawing.Color]::FromArgb(12,13,17)
     $form.ForeColor = $script:IXT.Fore
     $form.Font = New-Object System.Drawing.Font('Segoe UI',8)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.AutoScroll = $true
     $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $form.ClientSize = New-Object System.Drawing.Size([Math]::Min(1262,$workArea.Width - 30),[Math]::Min(846,$workArea.Height - 50))
+    $form.ClientSize = New-Object System.Drawing.Size([Math]::Min(1395,$workArea.Width - 30),[Math]::Min(848,$workArea.Height - 50))
     $script:IXT.Form = $form
     $script:IXT.Tip = New-Object System.Windows.Forms.ToolTip
+    $script:IXT.Tip.AutoPopDelay = 15000
 
     # --- top bar ---
     $caption = New-Object System.Windows.Forms.Label
-    $caption.Text = 'Adapter:'; $caption.Location = New-Object System.Drawing.Point(8,12); $caption.Size = New-Object System.Drawing.Size(52,16)
+    $caption.Text = 'Adapter:'; $caption.Location = New-Object System.Drawing.Point(12,14); $caption.Size = New-Object System.Drawing.Size(48,16)
     $form.Controls.Add($caption)
     $adapterCombo = New-Object System.Windows.Forms.ComboBox
     $adapterCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
     $adapterCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $adapterCombo.BackColor = [System.Drawing.Color]::Black; $adapterCombo.ForeColor = [System.Drawing.Color]::White
-    $adapterCombo.Location = New-Object System.Drawing.Point(62,8); $adapterCombo.Width = 300
+    $adapterCombo.Location = New-Object System.Drawing.Point(60,10); $adapterCombo.Width = 228; $adapterCombo.DropDownWidth = 360
     $form.Controls.Add($adapterCombo)
     $script:IXT.AdapterCombo = $adapterCombo
 
-    $openButton = New-IXTButton -Parent $form -Text 'Open' -X 370 -Y 8 -W 60 -Color $script:IXT.Fore
-    $applyAllButton = New-IXTButton -Parent $form -Text 'Apply All' -X 436 -Y 8 -W 76 -Color $green
-    $restartButton = New-IXTButton -Parent $form -Text 'Restart Adapter' -X 518 -Y 8 -W 110 -Color $red
-    $opacityButton = New-IXTButton -Parent $form -Text 'Opacity On/Off' -X 634 -Y 8 -W 100 -Color $script:IXT.Fore
-    $loadSavedButton = New-IXTButton -Parent $form -Text 'Load Saved' -X 740 -Y 8 -W 86 -Color $yellow
-    $loadOriginalButton = New-IXTButton -Parent $form -Text 'Load Original' -X 832 -Y 8 -W 96 -Color $yellow
-    $refreshButton = New-IXTButton -Parent $form -Text 'Refresh' -X 934 -Y 8 -W 70 -Color $script:IXT.Fore
-    $presetButton = New-IXTButton -Parent $form -Text 'Stable Preset' -X 1010 -Y 8 -W 100 -Color $green
-    $presetButton.Add_Click({ try { if ($script:IXT.Adapter) { Set-IXTStablePreset } } catch { Add-IXTLog ('Preset error: ' + $_.Exception.Message) } })
+    $openButton = New-IXTButton -Parent $form -Text 'Open' -X 296 -Y 10 -W 74 -Color $blue
+    $applyAllButton = New-IXTButton -Parent $form -Text 'Apply All' -X 376 -Y 10 -W 66 -Color $green
+    $restartButton = New-IXTButton -Parent $form -Text 'Restart Adapter' -X 448 -Y 10 -W 96 -Color $red
+    $opacityButton = New-IXTButton -Parent $form -Text 'Opacity On/Off' -X 550 -Y 10 -W 96 -Color $blue
+    $presetButton = New-IXTButton -Parent $form -Text 'Stable Preset' -X 668 -Y 10 -W 92 -Color $green
+    $loadSavedButton = New-IXTButton -Parent $form -Text 'Load Saved' -X 766 -Y 10 -W 82 -Color $yellow
+    $loadOriginalButton = New-IXTButton -Parent $form -Text 'Load Original' -X 854 -Y 10 -W 92 -Color $yellow
+    $refreshButton = New-IXTButton -Parent $form -Text 'Refresh' -X 952 -Y 10 -W 66 -Color $blue
+    $script:IXT.Tip.SetToolTip($openButton,'Open Registry Editor at this adapter''s key.')
+    $script:IXT.Tip.SetToolTip($presetButton,'Fill in the conservative stability values (same as console menu 9). Writes nothing by itself.')
+    $script:IXT.Tip.SetToolTip($loadOriginalButton,'Fill in the values this adapter had when the window first opened. Then press Apply All to restore them.')
+
+    $pendingLabel = New-Object System.Windows.Forms.Label
+    $pendingLabel.Location = New-Object System.Drawing.Point(1030,14); $pendingLabel.Size = New-Object System.Drawing.Size(250,16)
+    $pendingLabel.ForeColor = $script:IXT.Muted; $pendingLabel.Text = 'No pending changes'
+    $form.Controls.Add($pendingLabel); $script:IXT.PendingLabel = $pendingLabel
 
     $registryLabel = New-Object System.Windows.Forms.Label
-    $registryLabel.Location = New-Object System.Drawing.Point(8,36); $registryLabel.Size = New-Object System.Drawing.Size(1000,16)
+    $registryLabel.Location = New-Object System.Drawing.Point(12,40); $registryLabel.Size = New-Object System.Drawing.Size(900,16)
     $form.Controls.Add($registryLabel); $script:IXT.RegistryLabel = $registryLabel
     $ndisLabel = New-Object System.Windows.Forms.Label
-    $ndisLabel.Location = New-Object System.Drawing.Point(8,54); $ndisLabel.Size = New-Object System.Drawing.Size(1000,16)
+    $ndisLabel.Location = New-Object System.Drawing.Point(12,60); $ndisLabel.Size = New-Object System.Drawing.Size(900,16)
     $form.Controls.Add($ndisLabel); $script:IXT.NdisLabel = $ndisLabel
 
     $applyHandler = { try { Invoke-IXTApply -Sections @($this.Tag) } catch { Add-IXTLog ('Apply error: ' + $_.Exception.Message) } }
+    $addApply = {
+        param($X,$Y,$Sections)
+        $button = New-IXTButton -Parent $form -Text 'Apply' -X $X -Y $Y -W 52 -Color $blue
+        $button.Tag = $Sections
+        $button.Add_Click($applyHandler)
+    }
 
     # --- column 1: RSS / RSS Global / Interrupt ---
-    $group = New-IXTGroup -Parent $form -Text 'RSS Settings' -X 8 -Y 76 -W 216 -H 184
-    $y = 18
-    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'Status' -Label 'Status' -Y $y -LabelW 124 -CtrlW 74 -Items $onOff; $y += $rowHeight
-    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'NumberOfReceiveQueues' -Label 'NumberOfReceiveQueues' -Y $y -LabelW 124 -CtrlW 74 -TextBox; $y += $rowHeight
-    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'Profile' -Label 'Profile' -Y $y -LabelW 124 -CtrlW 74 -Items @('Closest','ClosestStatic','NUMA','NUMAStatic','Conservative'); $y += $rowHeight
-    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'BaseProcessor' -Label 'BaseProcessor' -Y $y -LabelW 124 -CtrlW 74 -TextBox; $y += $rowHeight
-    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'MaxProcessor' -Label 'MaxProcessor' -Y $y -LabelW 124 -CtrlW 74 -TextBox; $y += $rowHeight
-    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'MaxProcessors' -Label 'MaxProcessors' -Y $y -LabelW 124 -CtrlW 74 -TextBox; $y += $rowHeight
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y ($y + 4) -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('RSS'); $button.Add_Click($applyHandler)
+    $group = New-IXTGroup -Parent $form -Text 'RSS Settings' -X 10 -Y 84 -W 212 -H 186
+    $y = 16
+    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'Status' -Label 'Status' -Y $y -LabelW 112 -CtrlW 86 -Items $onOff; $y += $row
+    $queues = Add-IXTRow -Parent $group -Section 'RSS' -Name 'NumberOfReceiveQueues' -Label 'NumberOfReceiveQueues' -Y $y -LabelW 112 -CtrlW 86 -Items @('1','2','4','8','16'); $y += $row
+    $script:IXT.QueuesField = $queues
+    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'Profile' -Label 'Profile' -Y $y -LabelW 112 -CtrlW 86 -Items @('Closest','ClosestStatic','NUMA','NUMAStatic','Conservative'); $y += $row
+    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'BaseProcessor' -Label 'BaseProcessor' -Y $y -LabelW 112 -CtrlW 86 -Editable -Items @('0','1','2','4'); $y += $row
+    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'MaxProcessor' -Label 'MaxProcessor' -Y $y -LabelW 112 -CtrlW 86 -Editable; $y += $row
+    $null = Add-IXTRow -Parent $group -Section 'RSS' -Name 'MaxProcessors' -Label 'MaxProcessors' -Y $y -LabelW 112 -CtrlW 86 -Editable -Items @('1','2','4','8','16'); $y += $row
+    foreach ($rssRow in (Get-IXTFixedRows).Rss) {
+        $field = Add-IXTRow -Parent $group -Section 'AdvRss' -Name $rssRow[0] -Label $rssRow[0] -Y $y -LabelW 112 -CtrlW 86
+        $field | Add-Member -NotePropertyName Label -NotePropertyValue $rssRow[0] -Force
+        $y += $row
+    }
+    & $addApply 12 274 @('RSS','AdvRss')
+    $unlockButton = New-IXTButton -Parent $form -Text 'Unlock RSSQueues' -X 70 -Y 274 -W 112 -Color $yellow
+    $script:IXT.Tip.SetToolTip($unlockButton,'Lets you type any queue count. The driver still checks it when you press Apply; nothing in the driver is modified.')
+    $enableRssButton = New-IXTButton -Parent $form -Text 'Enable RSS Support' -X 12 -Y 300 -W 170 -Color $green
+    $script:IXT.Tip.SetToolTip($enableRssButton,'Fills in RSS = Enabled for the adapter, the global setting and the driver option. Writes nothing by itself.')
 
-    $group = New-IXTGroup -Parent $form -Text 'RSS Global' -X 8 -Y 266 -W 216 -H 96
-    $null = Add-IXTRow -Parent $group -Section 'RSSGlobal' -Name 'Tcpip' -Label 'TCP/IP_RssBaseCpu' -Y 18 -LabelW 124 -CtrlW 74 -TextBox
-    $null = Add-IXTRow -Parent $group -Section 'RSSGlobal' -Name 'NDIS' -Label 'NDIS_RssBaseCpu' -Y 40 -LabelW 124 -CtrlW 74 -TextBox
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y 66 -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('RSSGlobal'); $button.Add_Click($applyHandler)
+    $group = New-IXTGroup -Parent $form -Text 'RSS Global' -X 10 -Y 330 -W 212 -H 66
+    $null = Add-IXTRow -Parent $group -Section 'RSSGlobal' -Name 'Tcpip' -Label 'TCP/IP_RssBaseCpu' -Y 16 -LabelW 112 -CtrlW 86 -TextBox
+    $null = Add-IXTRow -Parent $group -Section 'RSSGlobal' -Name 'NDIS' -Label 'NDIS_RssBaseCpu' -Y 39 -LabelW 112 -CtrlW 86 -TextBox
 
-    $group = New-IXTGroup -Parent $form -Text 'Interrupt Settings' -X 8 -Y 368 -W 216 -H 118
+    $group = New-IXTGroup -Parent $form -Text 'Interrupt Settings' -X 10 -Y 402 -W 212 -H 104
     $msiMap = [ordered]@{ '' = 'Undefined'; '1' = 'Enabled'; '0' = 'Disabled' }
     $priorityMap = [ordered]@{ '' = 'Undefined'; '1' = 'Low'; '2' = 'Normal'; '3' = 'High' }
     $policyMap = [ordered]@{ '' = 'Undefined'; '0' = 'MachineDefault'; '1' = 'AllCloseProcessors'; '2' = 'OneCloseProcessor'; '3' = 'AllProcessorsInMachine'; '5' = 'SpreadMessagesAcrossAllProcessors' }
-    $null = Add-IXTRow -Parent $group -Section 'Interrupt' -Name 'MSISupported' -Label 'MSI Mode' -Y 18 -LabelW 96 -CtrlW 102 -Map $msiMap
-    $null = Add-IXTRow -Parent $group -Section 'Interrupt' -Name 'DevicePriority' -Label 'Interrupt Priority' -Y 40 -LabelW 96 -CtrlW 102 -Map $priorityMap
-    $null = Add-IXTRow -Parent $group -Section 'Interrupt' -Name 'DevicePolicy' -Label 'DevicePolicy' -Y 62 -LabelW 96 -CtrlW 102 -Map $policyMap
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y 88 -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('Interrupt'); $button.Add_Click($applyHandler)
+    $null = Add-IXTRow -Parent $group -Section 'Interrupt' -Name 'MSISupported' -Label 'MSI Mode' -Y 16 -LabelW 100 -CtrlW 96 -Map $msiMap
+    $null = Add-IXTRow -Parent $group -Section 'Interrupt' -Name 'DevicePriority' -Label 'Interrupt Priority' -Y 37 -LabelW 100 -CtrlW 96 -Map $priorityMap
+    $policyCaption = New-Object System.Windows.Forms.Label
+    $policyCaption.Text = 'DevicePolicy:'; $policyCaption.Location = New-Object System.Drawing.Point(8,61); $policyCaption.Size = New-Object System.Drawing.Size(120,16)
+    $group.Controls.Add($policyCaption)
+    $policy = Add-IXTRow -Parent $group -Section 'Interrupt' -Name 'DevicePolicy' -Label '' -Y 78 -LabelW 0 -CtrlW 196 -Map $policyMap -LabelX 6
+    & $addApply 12 512 @('RSSGlobal','Interrupt')
 
     # --- column 2: Global / Interface ---
-    $group = New-IXTGroup -Parent $form -Text 'Global Settings' -X 232 -Y 76 -W 300 -H 206
-    $y = 18
+    $group = New-IXTGroup -Parent $form -Text 'Global Settings' -X 228 -Y 84 -W 280 -H 168
+    $y = 16
     foreach ($name in $script:IXT.GlobalNames) {
         $items = $onOff
         if ($name -eq 'Chimney') { $items = @('Disabled','Enabled','Automatic') }
         elseif ($name -eq 'NetworkDirectAcrossIPSubnets') { $items = @('Blocked','Allowed') }
-        $null = Add-IXTRow -Parent $group -Section 'Global' -Name $name -Label $name -Y $y -LabelW 176 -CtrlW 104 -Items $items
-        $y += $rowHeight
+        $null = Add-IXTRow -Parent $group -Section 'Global' -Name $name -Label $name -Y $y -LabelW 160 -CtrlW 104 -Items $items
+        $y += $row
     }
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y ($y + 4) -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('Global'); $button.Add_Click($applyHandler)
-
-    $group = New-IXTGroup -Parent $form -Text 'Interface Settings' -X 232 -Y 288 -W 300 -H 550
+    & $addApply 230 258 @('Global')
     $checkV4 = New-Object System.Windows.Forms.CheckBox
-    $checkV4.Text = 'IPv4'; $checkV4.Checked = $true; $checkV4.Location = New-Object System.Drawing.Point(150,0); $checkV4.Size = New-Object System.Drawing.Size(52,16)
+    $checkV4.Text = 'IPv4'; $checkV4.Checked = $true; $checkV4.Location = New-Object System.Drawing.Point(410,260); $checkV4.Size = New-Object System.Drawing.Size(46,16)
     $checkV6 = New-Object System.Windows.Forms.CheckBox
-    $checkV6.Text = 'IPv6'; $checkV6.Location = New-Object System.Drawing.Point(206,0); $checkV6.Size = New-Object System.Drawing.Size(52,16)
-    $group.Controls.Add($checkV4); $group.Controls.Add($checkV6)
+    $checkV6.Text = 'IPv6'; $checkV6.Location = New-Object System.Drawing.Point(458,260); $checkV6.Size = New-Object System.Drawing.Size(46,16)
+    $form.Controls.Add($checkV4); $form.Controls.Add($checkV6)
     $script:IXT.ChkV4 = $checkV4; $script:IXT.ChkV6 = $checkV6
+    $script:IXT.Tip.SetToolTip($checkV4,'Interface Settings are applied to the ticked address families.')
+
+    $group = New-IXTGroup -Parent $form -Text 'Interface Settings' -X 228 -Y 282 -W 280 -H 530
     $interfaceRows = @(
         @('AdvertiseDefaultRoute',$onOff), @('Advertising',$onOff), @('AutomaticMetric',$onOff), @('ClampMss',$onOff),
         @('DirectedMacWolPattern',$onOff), @('EcnMarking',@('Disabled','UseEct1','UseEct0','AppDecide')),
         @('ForceArpNdWolPattern',$onOff), @('Forwarding',$onOff), @('IgnoreDefaultRoutes',$onOff),
-        @('ManagedAddressConfiguration',$onOff), @('NeighborUnreachabilityDetection',$onOff),
+        @('ManagedAddressConfiguration',$onOff), @('NeighborDiscoverySupported','INFO'),
+        @('NeighborUnreachabilityDetection',$onOff,'NeighborUnreachDetection'),
         @('OtherStatefulConfiguration',$onOff), @('RouterDiscovery',@('Disabled','Enabled','ControlledByDHCP')),
+        @('Store','STORE'),
         @('WeakHostReceive',$onOff), @('WeakHostSend',$onOff),
-        @('CurrentHopLimit',$null), @('BaseReachableTimeMs',$null), @('RetransmitTimeMs',$null),
-        @('DadRetransmitTimeMs',$null), @('DadTransmits',$null), @('NlMtuBytes',$null)
+        @('CurrentHopLimit',$null,'CurrentHopLimit',''), @('BaseReachableTimeMs',$null,'BaseReachableTime','ms'),
+        @('RetransmitTimeMs',$null,'RetransmitTime','ms'), @('ReachableTime','INFO','ReachableTime','ms'),
+        @('DadRetransmitTimeMs',$null,'DadRetransmitTime',''), @('DadTransmits',$null,'DadTransmits',''), @('NlMtuBytes',$null,'NlMtu','bytes')
     )
-    $y = 22
-    foreach ($row in $interfaceRows) {
-        $name = [string]$row[0]
-        $script:IXT.InterfaceNames += $name
-        if ($null -eq $row[1]) { $null = Add-IXTRow -Parent $group -Section 'Interface' -Name $name -Label $name -Y $y -LabelW 176 -CtrlW 104 -TextBox }
-        else { $null = Add-IXTRow -Parent $group -Section 'Interface' -Name $name -Label $name -Y $y -LabelW 176 -CtrlW 104 -Items $row[1] }
-        $y += $rowHeight
+    $y = 16
+    foreach ($interfaceRow in $interfaceRows) {
+        $name = [string]$interfaceRow[0]
+        $label = if ($interfaceRow.Count -ge 3 -and $interfaceRow[2]) { [string]$interfaceRow[2] } else { $name }
+        $unit = if ($interfaceRow.Count -ge 4) { [string]$interfaceRow[3] } else { '' }
+        if ($interfaceRow[1] -is [string] -and $interfaceRow[1] -eq 'INFO') {
+            $field = Add-IXTRow -Parent $group -Section 'Info' -Name $name -Label $label -Y $y -LabelW 150 -CtrlW 86 -ReadOnly -Unit $unit
+            $script:IXT.Tip.SetToolTip($field.Control,'Display only: Windows sets this value.')
+        } elseif ($interfaceRow[1] -is [string] -and $interfaceRow[1] -eq 'STORE') {
+            $storeCaption = New-Object System.Windows.Forms.Label
+            $storeCaption.Text = 'Store:'; $storeCaption.Location = New-Object System.Drawing.Point(8,($y + 3)); $storeCaption.Size = New-Object System.Drawing.Size(150,16)
+            $group.Controls.Add($storeCaption)
+            $storeCombo = New-Object System.Windows.Forms.ComboBox
+            $storeCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+            $storeCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $storeCombo.BackColor = [System.Drawing.Color]::Black; $storeCombo.ForeColor = [System.Drawing.Color]::FromArgb(255,150,40)
+            [void]$storeCombo.Items.Add('ActiveStore'); [void]$storeCombo.Items.Add('PersistentStore'); $storeCombo.SelectedIndex = 0
+            $storeCombo.Location = New-Object System.Drawing.Point(160,$y); $storeCombo.Width = 86
+            $group.Controls.Add($storeCombo); $script:IXT.StoreCombo = $storeCombo
+            $script:IXT.Tip.SetToolTip($storeCombo,'Which copy is shown: ActiveStore = in use now; PersistentStore = the saved copy used after a restart (Windows only keeps one once a setting was changed). Apply keeps both in step.')
+        } else {
+            $script:IXT.InterfaceNames += $name
+            if ($null -eq $interfaceRow[1]) { $null = Add-IXTRow -Parent $group -Section 'Interface' -Name $name -Label $label -Y $y -LabelW 150 -CtrlW 86 -TextBox -Unit $unit }
+            else { $null = Add-IXTRow -Parent $group -Section 'Interface' -Name $name -Label $label -Y $y -LabelW 150 -CtrlW 86 -Items $interfaceRow[1] }
+        }
+        $y += $row
     }
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y ($y + 6) -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('Interface'); $button.Add_Click($applyHandler)
+    & $addApply 230 818 @('Interface')
 
-    # --- column 3: Adv. Adapter / PowerSaving (driver-defined rows) ---
-    $group = New-IXTGroup -Parent $form -Text 'Adv. Adapter' -X 540 -Y 76 -W 372 -H 500
+    # --- column 3: Adv. Adapter / PowerSaving ---
+    $group = New-IXTGroup -Parent $form -Text 'Adv. Adapter' -X 514 -Y 84 -W 340 -H 450
     $advPanel = New-Object System.Windows.Forms.Panel
-    $advPanel.Location = New-Object System.Drawing.Point(4,16); $advPanel.Size = New-Object System.Drawing.Size(364,450); $advPanel.AutoScroll = $true
+    $advPanel.Location = New-Object System.Drawing.Point(2,15); $advPanel.Size = New-Object System.Drawing.Size(336,432); $advPanel.AutoScroll = $true
     $group.Controls.Add($advPanel); $script:IXT.AdvPanel = $advPanel
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y 472 -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('Adv'); $button.Add_Click($applyHandler)
+    & $addApply 516 540 @('Adv')
 
-    $group = New-IXTGroup -Parent $form -Text 'PowerSaving Settings' -X 540 -Y 582 -W 372 -H 256
+    $group = New-IXTGroup -Parent $form -Text 'PowerSaving Settings' -X 514 -Y 568 -W 270 -H 170
     $powerPanel = New-Object System.Windows.Forms.Panel
-    $powerPanel.Location = New-Object System.Drawing.Point(4,16); $powerPanel.Size = New-Object System.Drawing.Size(364,206); $powerPanel.AutoScroll = $true
+    $powerPanel.Location = New-Object System.Drawing.Point(2,15); $powerPanel.Size = New-Object System.Drawing.Size(266,152); $powerPanel.AutoScroll = $true
     $group.Controls.Add($powerPanel); $script:IXT.PowerPanel = $powerPanel
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y 228 -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('Power'); $button.Add_Click($applyHandler)
+    & $addApply 516 744 @('Power')
 
-    # --- column 4: AFD tweaks / log ---
-    $group = New-IXTGroup -Parent $form -Text 'Tweaks' -X 920 -Y 76 -W 334 -H 562
-    $afdNames = @(
-        'DefaultReceiveWindow','DefaultSendWindow','BufferMultiplier','BufferAlignment','DoNotHoldNICBuffers',
-        'SmallBufferSize','MediumBufferSize','LargeBufferSize','HugeBufferSize','SmallBufferListDepth',
-        'MediumBufferListDepth','LargeBufferListDepth','DisableAddressSharing','DisableChainedReceive',
-        'DisableDirectAcceptEx','DisableRawSecurity','DynamicSendBufferDisable','FastSendDatagramThreshold',
-        'FastCopyReceiveThreshold','IgnorePushBitOnReceives','IgnoreOrderlyRelease','TransmitWorker','PriorityBoost'
+    # --- column 4: Tweaks / log ---
+    $group = New-IXTGroup -Parent $form -Text 'Tweaks' -X 862 -Y 84 -W 336 -H 506
+    $afdRows = @(
+        @('DefaultReceiveWindow','DefaultReceiveWindow'),@('DefaultSendWindow','DefaultSendWindow'),@('BufferMultiplier','(Rec/Send) BufferMultiplier'),
+        @('BufferAlignment','BufferAlignment'),@('DoNotHoldNICBuffers','DoNotHoldNICBuffers'),@('SmallBufferSize','SmallBufferSize'),
+        @('MediumBufferSize','MediumBufferSize'),@('LargeBufferSize','LargeBufferSize'),@('HugeBufferSize','HugeBufferSize'),
+        @('SmallBufferListDepth','SmallBufferListDepth'),@('MediumBufferListDepth','MediumBufferListDepth'),@('LargeBufferListDepth','LargBufferListDepth'),
+        @('DisableAddressSharing','DisableAddressSharing'),@('DisableChainedReceive','DisableChainedReceive'),@('DisableDirectAcceptEx','DisableDirectAcceptEx'),
+        @('DisableRawSecurity','DisableRawSecurity'),@('DynamicSendBufferDisable','DynamicSendBufferDisable'),@('FastSendDatagramThreshold','FastSendDatagramThreshold'),
+        @('FastCopyReceiveThreshold','FastCopyReceiveThreshold'),@('IgnorePushBitOnReceives','IgnorePushBitOnReceives'),@('IgnoreOrderlyRelease','IgnoreOrderlyRelease'),
+        @('TransmitWorker','TransmitWorker'),@('PriorityBoost','PriorityBoost')
     )
-    $y = 18
-    foreach ($name in $afdNames) {
-        $field = Add-IXTRow -Parent $group -Section 'AFD' -Name $name -Label $name -Y $y -LabelW 176 -CtrlW 136 -TextBox
-        $script:IXT.Tip.SetToolTip($field.Control,'Empty = not set (Windows default). Takes effect after a Windows restart.')
-        $y += $rowHeight
+    $y = 16
+    foreach ($afdRow in $afdRows) {
+        $label = if ($afdRow[0] -eq 'LargeBufferListDepth') { 'LargeBufferListDepth' } else { $afdRow[1] }
+        $field = Add-IXTRow -Parent $group -Section 'AFD' -Name $afdRow[0] -Label $label -Y $y -LabelW 150 -CtrlW 164 -Editable -Items @('')
+        $script:IXT.Tip.SetToolTip($field.Control,('AFD\Parameters\{0}. Empty = not set (Windows default). Takes effect after a Windows restart.' -f $afdRow[0]))
+        $y += $row
     }
-    $button = New-IXTButton -Parent $group -Text 'Apply' -X 8 -Y ($y + 6) -W 60 -Color $script:IXT.Fore
-    $button.Tag = @('AFD'); $button.Add_Click($applyHandler)
+    & $addApply 864 596 @('AFD')
 
+    $logCaption = New-Object System.Windows.Forms.Label
+    $logCaption.Text = 'Log'; $logCaption.Location = New-Object System.Drawing.Point(864,626); $logCaption.Size = New-Object System.Drawing.Size(100,16)
+    $form.Controls.Add($logCaption)
     $logBox = New-Object System.Windows.Forms.TextBox
     $logBox.Multiline = $true; $logBox.ReadOnly = $true; $logBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
     $logBox.BackColor = [System.Drawing.Color]::Black; $logBox.ForeColor = $green
     $logBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $logBox.Location = New-Object System.Drawing.Point(920,644); $logBox.Size = New-Object System.Drawing.Size(334,194)
+    $logBox.Location = New-Object System.Drawing.Point(864,644); $logBox.Size = New-Object System.Drawing.Size(520,196)
     $form.Controls.Add($logBox); $script:IXT.LogBox = $logBox
+
+    $legend = New-Object System.Windows.Forms.Label
+    $legend.Text = "Blue = current Windows value`r`nAmber = changed, not applied yet`r`nGray = not available on this adapter`r`nHover any value for details"
+    $legend.Location = New-Object System.Drawing.Point(1208,92); $legend.Size = New-Object System.Drawing.Size(176,70)
+    $legend.ForeColor = $script:IXT.Muted
+    $form.Controls.Add($legend)
 
     # --- events ---
     $adapterCombo.Add_SelectedIndexChanged({ try { Select-IXTAdapter } catch { Add-IXTLog ('Adapter load error: ' + $_.Exception.Message) } })
+    $storeCombo.Add_SelectedIndexChanged({ try { if ($script:IXT.Adapter -and -not $script:IXT.Loading) { Read-IXTValues -Only @('Interface','Info'); Add-IXTLog ('Interface Settings now show the ' + $script:IXT.StoreCombo.SelectedItem + '.') } } catch { Add-IXTLog ('Store error: ' + $_.Exception.Message) } })
     $applyAllButton.Add_Click({
-        try { Invoke-IXTApply -Sections @('RSS','RSSGlobal','Interrupt','Global','Interface','Adv','Power','AFD') }
+        try { Invoke-IXTApply -Sections @('RSS','AdvRss','RSSGlobal','Interrupt','Global','Interface','Adv','Power','AFD') }
         catch { Add-IXTLog ('Apply error: ' + $_.Exception.Message) }
+    })
+    $presetButton.Add_Click({ try { if ($script:IXT.Adapter) { Set-IXTStablePreset } } catch { Add-IXTLog ('Preset error: ' + $_.Exception.Message) } })
+    $enableRssButton.Add_Click({ try { if ($script:IXT.Adapter) { Enable-IXTRssSupport } } catch { Add-IXTLog ('RSS error: ' + $_.Exception.Message) } })
+    $unlockButton.Add_Click({
+        try {
+            $combo = $script:IXT.QueuesField.Control
+            $current = $combo.Text
+            $combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+            $combo.Text = $current
+            Add-IXTLog 'RSS queue count unlocked: type any number. The driver rejects values it cannot use when you press Apply.'
+        } catch { Add-IXTLog ('Unlock error: ' + $_.Exception.Message) }
     })
     $refreshButton.Add_Click({ try { Read-IXTAll; Add-IXTLog 'Values re-read from Windows.' } catch { Add-IXTLog ('Refresh error: ' + $_.Exception.Message) } })
     $opacityButton.Add_Click({ if ($script:IXT.Form.Opacity -lt 1) { $script:IXT.Form.Opacity = 1 } else { $script:IXT.Form.Opacity = 0.85 } })
